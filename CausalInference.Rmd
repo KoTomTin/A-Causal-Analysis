@@ -1,0 +1,866 @@
+---
+title: "Environmental Toxic Burden, Socioeconomic Deprivation, and Mortality Inequality"
+subtitle: "A Causal Analysis Across Three Levels of Inference | Pooled NHANES 2007–2012"
+author: "Kaung Khant Tin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  warning    = FALSE,
+  message    = FALSE,
+  fig.width  = 10,
+  fig.height = 6
+)
+```
+
+---
+
+# Abstract {.unnumbered}
+
+This analysis uses pooled data from three cycles of the US National Health and Nutrition Examination Survey (NHANES 2007–2012; N = 10,410 White and Black Americans; 1,780 deaths) to investigate whether blood cadmium — a biomarker of cumulative environmental toxic burden — partially explains the well-established link between socioeconomic deprivation and premature mortality. The analysis is structured around Judea Pearl's three levels of causal inference: association, intervention, and counterfactual. After adjusting for age, sex, race, socioeconomic status, and smoking, each e-fold increase in blood cadmium was associated with 36% higher all-cause mortality (HR 1.364, 95% CI 1.247–1.492). The crude racial mortality gap disappeared entirely once structural pathways were accounted for (HR 0.938, p = 0.282), consistent with the interpretation that racial health inequalities in this population are structurally produced rather than biologically inherent. A new additive interaction analysis (RERI = 0.088, 95% CI −0.46 to 0.64) found a positive but imprecise signal of synergy between poverty and high cadmium burden, suggesting that environmental interventions may produce disproportionately larger benefits in deprived communities — a hypothesis requiring larger data to confirm. Using g-computation, equalising cadmium exposure between the most and least deprived groups would improve 10-year survival by 1.62 percentage points (95% CI 1.14–2.14), corresponding to approximately 12.85% of excess mortality among people below the poverty line. This analysis serves as a methodological proof of concept for applying causal inference frameworks to environmental health inequality questions — the conceptual and analytical foundation of my proposed PhD research at the University of Manchester's Division of Cancer Sciences.
+
+---
+
+# Background and Motivation
+
+The proposed PhD project at Manchester's Division of Cancer Sciences asks a deceptively simple question: does where you live — specifically, what you breathe, what surrounds you, how much green space you can access — affect how well you survive cancer treatment? And does it do so unequally across socioeconomic groups?
+
+This is not a question that descriptive epidemiology can answer cleanly. The challenge is causal: patients who live in more polluted areas also tend to be poorer, have more comorbidities, present at later cancer stages, and face more barriers to timely treatment. Any association between pollution exposure and worse cancer outcomes is therefore hopelessly entangled with these other factors unless you impose a rigorous causal framework. You need to be explicit about what you are adjusting for and why, what pathways you are trying to isolate, and what your estimate would mean if the assumptions held.
+
+To demonstrate that I can apply this kind of thinking, I built a mimic analysis using publicly available data where an analogous causal question is tractable. The US National Health and Nutrition Examination Survey (NHANES) provides individual-level data on environmental toxic burden, socioeconomic position, and mortality — linked through the National Death Index. Blood cadmium serves as my exposure of interest, not because cadmium is the most policy-relevant pollutant, but because it is a useful proxy for cumulative environmental toxic burden: it accumulates in renal tubules over decades from industrial emissions, contaminated food, occupational contact, and cigarette smoke, meaning a single blood measurement approximates lifetime environmental exposure. The socioeconomic gradient in cadmium burden — with more deprived communities carrying systematically higher loads — mirrors the gradient in PM2.5, NO₂, and black carbon that is at the heart of the PhD project.
+
+The causal question I am asking here is: does socioeconomic deprivation partly translate into premature mortality *through* differential environmental toxic burden? And if we could equalise that burden between the most and least deprived, how much of the mortality gap would close? These are the same structural questions the PhD asks about cancer outcomes, just in a different data context with a different exposure biomarker and a different outcome.
+
+The analysis is structured around Judea Pearl's three-level framework for causal inference — association, intervention, and counterfactual — because this framework makes the epistemological limits of each analytical step explicit. Describing a pattern (Level 1) is not the same as estimating an effect under adjustment (Level 2), which is not the same as simulating what would happen under a policy intervention (Level 3). Keeping these levels distinct is not pedantry — it is the discipline that separates credible causal claims from inflated observational associations. It is also the discipline the PhD project will require.
+
+---
+
+# Data and Setup
+
+## Packages
+```{r packages}
+required_packages <- c(
+  "nhanesA", "tidyverse", "survival",
+  "gtsummary", "survminer", "readr",
+  "broom", "patchwork", "knitr"
+)
+
+for (pkg in required_packages) {
+  if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+cat("All packages loaded.\n")
+```
+
+## Data Download
+
+The analysis brings together four data sources from the CDC, linked at the individual level via each participant's unique sequence number (SEQN). Mortality linkage files are fixed-width text files downloaded directly from the CDC FTP server; survey files are retrieved via the `nhanesA` package which handles all XPT parsing.
+```{r mortality}
+read_nhanes_mort <- function(url) {
+  mort_file <- tempfile()
+  download.file(url, mort_file, mode = "wb", quiet = TRUE)
+  read_fwf(
+    mort_file,
+    fwf_cols(
+      SEQN         = c(1,  6),
+      eligstat     = c(15, 15),
+      mortstat     = c(16, 16),
+      ucod_leading = c(17, 19),
+      diabetes     = c(20, 20),
+      hyperten     = c(21, 21),
+      permth_int   = c(43, 45),
+      permth_exm   = c(46, 48)
+    ),
+    show_col_types = FALSE
+  )
+}
+
+base_url <- paste0("https://ftp.cdc.gov/pub/Health_Statistics/NCHS/",
+                   "datalinkage/linked_mortality/")
+
+mort_2007 <- read_nhanes_mort(paste0(base_url,
+  "NHANES_2007_2008_MORT_2019_PUBLIC.dat"))
+mort_2009 <- read_nhanes_mort(paste0(base_url,
+  "NHANES_2009_2010_MORT_2019_PUBLIC.dat"))
+mort_2011 <- read_nhanes_mort(paste0(base_url,
+  "NHANES_2011_2012_MORT_2019_PUBLIC.dat"))
+
+cat("Mortality records downloaded:\n")
+cat("  2007-08:", nrow(mort_2007), "\n")
+cat("  2009-10:", nrow(mort_2009), "\n")
+cat("  2011-12:", nrow(mort_2011), "\n")
+```
+```{r survey-files}
+demo_2007    <- nhanes("DEMO_E")
+lab_cdm_2007 <- nhanes("PBCD_E")
+lab_cot_2007 <- nhanes("COTNAL_E")
+smq_2007     <- nhanes("SMQ_E")
+
+demo_2009    <- nhanes("DEMO_F")
+lab_cdm_2009 <- nhanes("PBCD_F")
+lab_cot_2009 <- nhanes("COTNAL_F")
+smq_2009     <- nhanes("SMQ_F")
+
+demo_2011    <- nhanes("DEMO_G")
+lab_cdm_2011 <- nhanes("PBCD_G")
+lab_cot_2011 <- nhanes("COTNAL_G")
+smq_2011     <- nhanes("SMQ_G")
+
+cat("Survey files downloaded for all three cycles.\n")
+```
+
+## Harmonisation and Pooling
+
+Pooling three cycles rather than using a single one is a power decision: a single NHANES cycle produces too few deaths — particularly among subgroups — for stable regression estimates. Three cycles gives N = 10,410 White and Black Americans with 1,780 all-cause deaths. Following CDC guidelines, the 2-year survey weights are divided by 3.
+
+Three harmonisation challenges required explicit handling: the race variable changed name between cycles (RIDRETH1 to RIDRETH3 in 2011–12); `nhanesA` returns labelled text values rather than numeric codes; and self-reported smoking had to be joined from a separate questionnaire file, with missing records classified as Never.
+```{r harmonise}
+clean_cycle <- function(demo, mort, cdm, cot, smq, cycle_year) {
+
+  if ("RIDRETH3" %in% names(demo)) {
+    demo <- demo %>% mutate(RACE_VAR = as.character(RIDRETH3))
+  } else {
+    demo <- demo %>% mutate(RACE_VAR = as.character(RIDRETH1))
+  }
+
+  demo %>%
+    inner_join(mort, by = "SEQN") %>%
+    inner_join(cdm %>% select(SEQN, LBXBCD), by = "SEQN") %>%
+    inner_join(cot %>% select(SEQN, LBXCOT), by = "SEQN") %>%
+    left_join(smq  %>% select(SEQN, SMQ040), by = "SEQN") %>%
+    filter(
+      eligstat == 1,
+      RIDAGEYR >= 20,
+      mortstat %in% c("0", "1")
+    ) %>%
+    mutate(
+      cycle          = cycle_year,
+      surv_months    = as.numeric(permth_exm),
+      allcause_death = as.numeric(mortstat),
+
+      cancer_death = case_when(
+        mortstat == "1" & ucod_leading == "002" ~ 1,
+        mortstat == "0"                         ~ 0,
+        mortstat == "1" & ucod_leading != "002" ~ 0,
+        TRUE ~ NA_real_
+      ),
+
+      race = case_when(
+        RACE_VAR == "Non-Hispanic White"                        ~ "White",
+        RACE_VAR == "Non-Hispanic Black"                        ~ "Black",
+        RACE_VAR %in% c("Mexican American", "Other Hispanic",
+                        "Hispanic")                             ~ "Hispanic",
+        RACE_VAR == "Non-Hispanic Asian"                        ~ "Asian",
+        TRUE ~ NA_character_
+      ),
+      race = factor(race, levels = c("White", "Black",
+                                     "Hispanic", "Asian")),
+
+      sex           = factor(RIAGENDR, levels = c("Male", "Female")),
+      age           = RIDAGEYR,
+      poverty_ratio = INDFMPIR,
+
+      ses_cat = case_when(
+        INDFMPIR <  1.0 ~ "Below poverty",
+        INDFMPIR <  3.0 ~ "Low-middle",
+        INDFMPIR >= 3.0 ~ "Middle-high",
+        TRUE ~ NA_character_
+      ),
+      ses_cat = factor(ses_cat,
+                       levels = c("Middle-high", "Low-middle",
+                                  "Below poverty")),
+
+      education = case_when(
+        DMDEDUC2 %in% c(
+          "Less than 9th grade",
+          "9-11th grade (Includes 12th grade with no diploma)"
+        ) ~ "Less than high school",
+        DMDEDUC2 == "High school graduate/GED or equivalent"
+          ~ "High school",
+        DMDEDUC2 %in% c("Some college or AA degree",
+                        "College graduate or above")
+          ~ "College or above",
+        TRUE ~ NA_character_
+      ),
+      education = factor(education,
+                         levels = c("College or above", "High school",
+                                    "Less than high school")),
+
+      cadmium_raw  = LBXBCD,
+      cadmium_log  = log(LBXBCD),
+      cotinine_raw = LBXCOT,
+      cotinine_log = log(LBXCOT + 0.011),
+
+      smoking = case_when(
+        SMQ040 == "Every day"  ~ "Current",
+        SMQ040 == "Some days"  ~ "Current",
+        SMQ040 == "Not at all" ~ "Former/Never",
+        is.na(SMQ040)          ~ "Never",
+        TRUE ~ NA_character_
+      ),
+      smoking = factor(smoking,
+                       levels = c("Never", "Former/Never", "Current"))
+    ) %>%
+    filter(
+      !is.na(surv_months), !is.na(cancer_death),
+      !is.na(cadmium_raw), !is.na(cotinine_raw),
+      !is.na(race), !is.na(age), !is.na(sex),
+      surv_months > 0
+    )
+}
+
+cycle_2007 <- clean_cycle(demo_2007, mort_2007,
+                          lab_cdm_2007, lab_cot_2007,
+                          smq_2007, "2007-2008")
+cycle_2009 <- clean_cycle(demo_2009, mort_2009,
+                          lab_cdm_2009, lab_cot_2009,
+                          smq_2009, "2009-2010")
+cycle_2011 <- clean_cycle(demo_2011, mort_2011,
+                          lab_cdm_2011, lab_cot_2011,
+                          smq_2011, "2011-2012")
+
+cat("Per-cycle merge:\n")
+cat("  2007-08:", nrow(cycle_2007), "\n")
+cat("  2009-10:", nrow(cycle_2009), "\n")
+cat("  2011-12:", nrow(cycle_2011), "\n")
+```
+```{r pool}
+pooled_data <- bind_rows(cycle_2007, cycle_2009, cycle_2011) %>%
+  mutate(
+    cadmium_q = ntile(cadmium_raw, 4),
+    cadmium_q = factor(cadmium_q, levels = 1:4,
+                       labels = c("Q1 (lowest)", "Q2",
+                                  "Q3", "Q4 (highest)")),
+    cadmium_hilow = factor(
+      ifelse(cadmium_raw >= median(cadmium_raw, na.rm = TRUE),
+             "High", "Low"),
+      levels = c("Low", "High")
+    ),
+    wtmec_pooled = WTMEC2YR / 3
+  )
+
+wb_data <- pooled_data %>%
+  filter(race %in% c("White", "Black")) %>%
+  mutate(race = droplevels(race))
+
+surv_allcause_wb <- Surv(wb_data$surv_months, wb_data$allcause_death)
+surv_cancer_wb   <- Surv(wb_data$surv_months, wb_data$cancer_death)
+surv_cancer_all  <- Surv(pooled_data$surv_months, pooled_data$cancer_death)
+
+cat("=====================================================\n")
+cat("POOLED NHANES DATASET READY\n")
+cat("=====================================================\n")
+cat("Total participants (all races):", nrow(pooled_data), "\n")
+cat("White + Black subset:          ", nrow(wb_data),     "\n")
+cat("All-cause deaths (W+B):        ", sum(wb_data$allcause_death), "\n")
+cat("Cancer deaths (W+B):           ", sum(wb_data$cancer_death),   "\n")
+cat("Event rate:                    ",
+    round(mean(wb_data$allcause_death) * 100, 1), "%\n")
+cat("Follow-up range (months):      ",
+    min(wb_data$surv_months), "–", max(wb_data$surv_months), "\n")
+```
+
+## Causal Framework: The DAG
+
+Before fitting a single model, I needed to make my assumptions explicit. A Directed Acyclic Graph is not something you draw after the analysis to justify what you found — it is a prior commitment to the causal structure you believe is operating, which then determines your adjustment strategy. Getting this wrong renders even sophisticated modelling uninterpretable.
+
+My assumed structure is as follows. Race operates as a distal structural cause — it shapes which socioeconomic conditions people inhabit through residential segregation and labour market discrimination, but does not cause mortality through biology. If this is correct, race should lose predictive power once we adjust for the structural pathways it produces. SES is a positive confounder of the cadmium-mortality relationship: deprived people face higher cadmium exposure *and* higher mortality through multiple independent mechanisms, meaning the crude cadmium-mortality association is inflated by the SES signal running through it. Smoking plays a dual role — SES predicts smoking initiation (making it a confounder), and smoking is one route through which people accumulate cadmium (making it a mediating pathway). Age is a negative confounder: younger people in working-age occupations carry higher cadmium but have lower mortality, so failing to adjust for age actually *masks* part of the cadmium effect. Unmeasured confounders — healthcare access, full residential history, dietary quality — almost certainly exist, meaning causal estimates should be treated as upper bounds.
+```
+Residential segregation ──→ Race ──→ Neighbourhood deprivation
+                                              │
+                                              ↓
+                SES ──────────────→ Cadmium ──────────→ Mortality
+                 │                    ↑                    ↑
+                 └────────────────────┘                    │
+                 └───────────────────────────────────────── ┘
+                              (direct SES pathway)
+
+Smoking ──→ Cadmium
+   ↑
+  SES
+
+Age, Sex ──→ Mortality
+```
+
+From this DAG, the minimal adjustment set for estimating the causal effect of cadmium on mortality is {age, sex, race, SES}. Smoking is added to the primary model not as a simple confounder but as a way of isolating the non-smoking environmental cadmium pathway — the residual HR after smoking adjustment represents cadmium accumulation from industrial, dietary, and residential sources, which is the policy-relevant quantity.
+
+## Hypotheses
+
+| # | Hypothesis |
+|---|---|
+| H1 | Higher blood cadmium is independently associated with all-cause mortality after full adjustment |
+| H2 | Lower SES is associated with higher blood cadmium in a dose-response pattern |
+| H3 | Black Americans carry higher cadmium than White Americans within each smoking category |
+| H4 | Smoking adjustment attenuates the cadmium HR, consistent with blocking the smoking-mediated pathway |
+| H5 | Race does not modify the cadmium-mortality association |
+| H6 | Equalising cadmium exposure between the most and least deprived groups would improve 10-year survival |
+| H7 | Poverty and high cadmium act synergistically on the absolute mortality scale (RERI > 0) |
+
+---
+
+# Level 1 — Association
+
+*At this level I am simply describing what is in the data — what patterns exist, and whether they motivate the causal questions I want to ask. No causal claims are made here. These results are necessary but not sufficient.*
+
+## Who is in the sample?
+```{r table1}
+wb_data %>%
+  dplyr::select(race, age, sex, ses_cat, smoking,
+                cadmium_raw, allcause_death) %>%
+  mutate(
+    allcause_death = factor(allcause_death,
+                            levels = c(0, 1),
+                            labels = c("Alive", "Died"))
+  ) %>%
+  tbl_summary(
+    by = race,
+    label = list(
+      age            ~ "Age (years)",
+      sex            ~ "Sex",
+      ses_cat        ~ "Socioeconomic status",
+      smoking        ~ "Smoking status",
+      cadmium_raw    ~ "Blood cadmium (ug/L)",
+      allcause_death ~ "All-cause mortality"
+    ),
+    statistic = list(
+      all_continuous()  ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  add_p() %>%
+  bold_labels() %>%
+  modify_caption(
+    "**Table 1. Baseline characteristics by race**
+    Pooled NHANES 2007–2012 (White + Black Americans)"
+  )
+```
+
+Three things in Table 1 set up everything that follows. First, White Americans are older (median 52 vs 50 years). That two-year difference sounds small but it drives a paradox I will return to shortly — White Americans show *higher* crude mortality (19% vs 13%) despite being more affluent, entirely because of this age composition difference. Second, the socioeconomic gap between groups is substantial: 25% of Black Americans fall below the poverty line versus 17% of White Americans. This structural difference is the core of the environmental justice argument running through this analysis. Third — and this is the observation that most directly motivated the analysis — Black Americans smoke at similar or slightly higher rates than White Americans (25% vs 23% current) but carry modestly higher blood cadmium (median 0.37 vs 0.35 μg/L). If cadmium were simply a smoking proxy, the group that smokes more should carry more cadmium. The fact that the gap persists suggests sources beyond cigarettes — industrial proximity, dietary contamination, residential exposure — distributed along socioeconomic rather than purely behavioural lines.
+
+## Where does cadmium accumulate?
+```{r cadmium-plots, fig.height=5}
+p1 <- wb_data %>%
+  ggplot(aes(race, cadmium_log, fill = race)) +
+  geom_boxplot(alpha = 0.7, outlier.alpha = 0.3) +
+  scale_fill_manual(values = c("#2E9FDF", "#E7B800")) +
+  labs(title = "Cadmium by Race",
+       x = NULL, y = "Log cadmium (ug/L)") +
+  theme_minimal() + theme(legend.position = "none")
+
+p2 <- wb_data %>%
+  filter(!is.na(ses_cat)) %>%
+  ggplot(aes(ses_cat, cadmium_log, fill = ses_cat)) +
+  geom_boxplot(alpha = 0.7, outlier.alpha = 0.3) +
+  scale_fill_manual(values = c("#2E9FDF", "#E7B800", "#E84B23")) +
+  labs(title = "Cadmium by SES",
+       x = NULL, y = "Log cadmium (ug/L)") +
+  theme_minimal() + theme(legend.position = "none")
+
+p3 <- wb_data %>%
+  filter(!is.na(smoking)) %>%
+  ggplot(aes(smoking, cadmium_log, fill = smoking)) +
+  geom_boxplot(alpha = 0.7, outlier.alpha = 0.3) +
+  scale_fill_manual(values = c("#2E9FDF", "#E7B800", "#E84B23")) +
+  labs(title = "Cadmium by Smoking",
+       x = NULL, y = "Log cadmium (ug/L)") +
+  theme_minimal() + theme(legend.position = "none")
+
+p1 + p2 + p3
+```
+
+The middle panel is the one that matters most to me analytically. The SES-cadmium relationship is not a threshold effect hitting only the very poorest — it is a graded dose-response, with each step down in income associated with progressively higher cadmium burden. On the raw scale, the below-poverty median is roughly double the middle-high median (approximately 0.50 vs 0.30 μg/L). This graded pattern has a direct policy implication: interventions targeting only the most extreme poverty would miss the substantial excess burden carried by the low-middle income group. The gradient needs to be addressed across its full range.
+
+The smoking panel confirms what we expect — current smokers carry dramatically higher cadmium than never-smokers. But the never-smoker median is not zero. People who have never smoked still carry measurable cadmium, accumulated from food, water, and air. That baseline environmental burden is what varies by SES.
+```{r cadmium-race-smoking, fig.height=5}
+wb_data %>%
+  filter(!is.na(smoking)) %>%
+  ggplot(aes(race, cadmium_log, fill = race)) +
+  geom_boxplot(alpha = 0.7, outlier.alpha = 0.3) +
+  facet_wrap(~smoking) +
+  scale_fill_manual(values = c("#2E9FDF", "#E7B800")) +
+  labs(
+    title    = "Blood Cadmium by Race, Stratified by Smoking Status",
+    subtitle = "Racial cadmium gap persists within each smoking category — non-smoking sources contribute",
+    x = NULL, y = "Log cadmium (ug/L)"
+  ) +
+  theme_minimal() + theme(legend.position = "none")
+```
+```{r cadmium-table}
+wb_data %>%
+  filter(!is.na(smoking)) %>%
+  group_by(smoking, race) %>%
+  summarise(
+    n              = n(),
+    median_cad_log = round(median(cadmium_log, na.rm = TRUE), 3),
+    median_cad_raw = round(median(cadmium_raw, na.rm = TRUE), 3),
+    .groups = "drop"
+  ) %>%
+  kable(
+    col.names = c("Smoking", "Race", "N",
+                  "Median log-cadmium", "Median raw cadmium (ug/L)"),
+    caption   = "**Table 2. Median cadmium by race within smoking categories**"
+  )
+```
+
+By fixing smoking status and comparing across racial groups, I can ask whether the racial cadmium gap disappears once tobacco exposure is equalised. It does not — the gap persists in every smoking category. In never-smokers, White Americans have a median raw cadmium of 0.25 μg/L versus 0.27 μg/L for Black Americans. In current smokers, the groups converge (both around 1.10 μg/L) — at very high cadmium driven by heavy smoking, the environmental signal is swamped by the tobacco signal. The environmental justice evidence is clearest in never-smokers, where tobacco cannot explain anything.
+
+## Does cadmium predict survival, and what does the racial comparison look like?
+```{r km1, fig.height=7}
+km_cad <- survfit(Surv(surv_months, cancer_death) ~ cadmium_hilow,
+                  data = pooled_data)
+ggsurvplot(
+  km_cad, data = pooled_data,
+  pval = TRUE, conf.int = TRUE,
+  risk.table = TRUE, risk.table.height = 0.25,
+  legend.labs  = c("Low cadmium", "High cadmium"),
+  legend.title = "",
+  title   = "Cancer mortality by cadmium level\nPooled NHANES 2007–2012 (all races)",
+  xlab    = "Time (months)", ylab = "Survival probability",
+  palette = c("#2166ac", "#d6604d"),
+  ggtheme = theme_minimal()
+)
+```
+
+The cancer survival curves begin together and start separating at around 40 months, diverging progressively thereafter (p<0.0001). The timing matters: cadmium accumulates in renal tubules over decades and its toxic effects are cumulative rather than acute. I would not expect an immediate survival difference at baseline — the fact that the gap widens with longer follow-up is consistent with a mechanism of progressive biological damage, not confounding by an acute exposure.
+```{r km2, fig.height=7}
+km_race <- survfit(Surv(surv_months, allcause_death) ~ race,
+                   data = wb_data)
+ggsurvplot(
+  km_race, data = wb_data,
+  pval = TRUE, conf.int = TRUE,
+  risk.table = TRUE, risk.table.height = 0.25,
+  legend.labs  = c("White", "Black"), legend.title = "Race",
+  title   = "All-cause survival by race — CRUDE (age confounded)\nPooled NHANES 2007–2012",
+  xlab    = "Time (months)", ylab = "Survival probability",
+  palette = c("#2E9FDF", "#E7B800"),
+  ggtheme = theme_minimal()
+)
+```
+
+This curve is the most important methodological lesson in the whole analysis. In the crude unadjusted comparison, Black Americans appear to survive *better* than White Americans (p<0.0001). This is entirely wrong as a causal claim — it is an artefact of the older age distribution in the White American sample. The White sample has a higher median age and more participants in the 65+ range where mortality accelerates. The crude curve is picking up that age composition difference, not a genuine racial survival advantage.
+
+I include this curve deliberately, not to mislead, but to illustrate exactly why unadjusted comparisons in observational data are dangerous. The question of what happens *after* adjustment — controlling for age, SES, cadmium, and smoking — is what Level 2 exists to answer.
+```{r km3, fig.height=7}
+km_ses <- survfit(
+  Surv(surv_months, allcause_death) ~ ses_cat,
+  data = wb_data %>% filter(!is.na(ses_cat))
+)
+ggsurvplot(
+  km_ses, data = wb_data %>% filter(!is.na(ses_cat)),
+  pval = TRUE, conf.int = FALSE,
+  risk.table = TRUE, risk.table.height = 0.25,
+  legend.title = "SES",
+  title   = "All-cause survival by SES\nPooled NHANES 2007–2012 (White + Black)",
+  xlab    = "Time (months)", ylab = "Survival probability",
+  palette = c("#2E9FDF", "#E7B800", "#E84B23"),
+  ggtheme = theme_minimal()
+)
+```
+
+The SES survival gradient is clear and persistent across the entire follow-up period — middle-high income (blue) sits consistently above low-middle (yellow), which sits above below-poverty (red). All three curves diverge from the earliest timepoints and the separation widens through to 160 months.
+
+One nuance worth noting: around months 80–100, the below-poverty curve sits fractionally above low-middle before converging. This is the near-poor paradox — a well-documented phenomenon in US health data where people just above the poverty threshold earn too much to qualify for Medicaid but too little to afford private insurance, creating a healthcare coverage gap. It is a US-specific artefact of means-tested insurance systems and would not be expected in settings with universal healthcare coverage.
+
+---
+
+# Level 2 — Intervention
+
+*Moving from description to estimation. The question now is not what patterns I observe but what the effect of cadmium would be if I could hold everything else fixed. I approximate this through sequential multivariable adjustment, guided by the DAG.*
+
+## Building the model sequence
+
+I fit five Cox proportional hazards models, each adding a new block of covariates. The strategy is not simply to reach a fully adjusted model — it is to watch *how* the cadmium hazard ratio changes with each addition, because each change tells me something specific about the confounding structure.
+```{r cox-models}
+m1 <- coxph(Surv(surv_months, allcause_death) ~
+              cadmium_log,
+            data = wb_data)
+
+m2 <- coxph(Surv(surv_months, allcause_death) ~
+              cadmium_log + age + sex,
+            data = wb_data)
+
+m3 <- coxph(Surv(surv_months, allcause_death) ~
+              cadmium_log + age + sex + race + ses_cat,
+            data = wb_data)
+
+m4 <- coxph(Surv(surv_months, allcause_death) ~
+              cadmium_log + age + sex + race + ses_cat + smoking,
+            data = wb_data)
+
+m5 <- coxph(Surv(surv_months, allcause_death) ~
+              cadmium_log + age + sex + race + ses_cat + smoking +
+              cadmium_log:race,
+            data = wb_data)
+```
+```{r hr-attenuation}
+models     <- list(m1, m2, m3, m4, m5)
+mod_labels <- c("Model 1: Crude",
+                "Model 2: + Age + Sex",
+                "Model 3: + Race + SES",
+                "Model 4: + Smoking (FINAL)",
+                "Model 5: + Cadmium × Race")
+
+cat("Cadmium HR across sequential models (per e-fold increase)\n")
+cat("=========================================\n\n")
+
+hrs <- numeric(length(models))
+for (i in seq_along(models)) {
+  r      <- tidy(models[[i]], exponentiate = TRUE, conf.int = TRUE) %>%
+              filter(term == "cadmium_log")
+  hrs[i] <- r$estimate
+  cat(mod_labels[i], "\n")
+  cat("  HR =", round(r$estimate, 3),
+      "| 95% CI:", round(r$conf.low, 3), "–", round(r$conf.high, 3),
+      "| p =", ifelse(r$p.value < 0.001, "<0.001",
+                      round(r$p.value, 3)), "\n\n")
+}
+
+cat("=========================================\n")
+cat("Attenuation decomposition:\n\n")
+cat("M1→M2 (+age/sex):  ",
+    round((hrs[2] - hrs[1]) / hrs[1] * 100, 1),
+    "% — negative confounding by age\n")
+cat("M2→M3 (+race/SES): ",
+    round((hrs[3] - hrs[2]) / hrs[2] * 100, 1),
+    "% — positive confounding by SES\n")
+cat("M3→M4 (+smoking):  ",
+    round((hrs[4] - hrs[3]) / hrs[3] * 100, 1),
+    "% — smoking-mediated pathway blocked\n")
+cat("Final independent HR:", round(hrs[4], 3), "\n")
+```
+
+The HR sequence is exactly what the DAG predicted, and it is worth dwelling on each transition.
+
+**M1 → M2 (+10%):** Adding age and sex *increases* the HR from 1.439 to 1.583. This seems counterintuitive — adding covariates usually reduces an association, not inflates it. But this is negative confounding by age operating exactly as expected: younger people in working-age occupations tend to carry higher cadmium, but younger people also have lower mortality. In the crude model, the cadmium-mortality association was being partially masked by this age signal running in the opposite direction. Adjusting for age unmasks the true cadmium effect.
+
+**M2 → M3 (−5.7%):** Adding race and SES reduces the HR to 1.493. This is positive confounding — deprived people face both higher cadmium and higher mortality through independent mechanisms (healthcare access, nutrition, housing quality). Some of what looked like a cadmium effect in M2 was actually an SES effect.
+
+**M3 → M4 (−8.7%):** Adding smoking reduces the HR to 1.364. This is the smoking-mediated cadmium pathway being blocked. What remains — a 36% increase in mortality per e-fold increase in cadmium — is the effect operating through non-smoking routes: industrial emissions, contaminated food, residential proximity to pollution sources. This is the environmentally-sourced cadmium signal, and it is substantial and highly significant.
+
+A note on interpretation: the HR changes across models cannot be formally read as "proportion mediated" estimates. The Cox hazard ratio is non-collapsible — it changes when covariates are added even in the absence of true confounding or mediation, as a mathematical property of the model structure. I present the attenuation sequence as *structural evidence of confounding directionality*, not as a formal mediation decomposition.
+
+## The final adjusted model
+```{r model4-table}
+tidy(m4, exponentiate = TRUE, conf.int = TRUE) %>%
+  mutate(
+    p_fmt = case_when(
+      p.value < 0.001 ~ "<0.001 ***",
+      p.value < 0.01  ~ paste0(round(p.value, 3), " **"),
+      p.value < 0.05  ~ paste0(round(p.value, 3), " *"),
+      TRUE            ~ as.character(round(p.value, 3))
+    )
+  ) %>%
+  dplyr::select(term, estimate, conf.low, conf.high, p_fmt) %>%
+  mutate(across(c(estimate, conf.low, conf.high), ~ round(., 3))) %>%
+  kable(
+    col.names = c("Variable", "HR", "Lower 95% CI",
+                  "Upper 95% CI", "p-value"),
+    caption   = "**Table 3. Final adjusted Cox model (Model 4)**
+    All-cause mortality, White + Black Americans, pooled NHANES 2007–2012"
+  )
+```
+
+The cadmium HR of 1.364 (95% CI 1.247–1.492, p<0.001) means that each e-fold (approximately 2.72-fold) increase in blood cadmium is associated with 36% higher all-cause mortality after full adjustment. This is not a marginal or borderline finding.
+
+The race coefficient is where I want to spend a moment. After adjusting for age, SES, cadmium, and smoking, Black Americans have an HR of 0.938 (p = 0.282) — not significantly different from White Americans. The crude racial mortality gap that appeared in the Kaplan-Meier curve has been entirely explained by measurable structural factors. Race, as a biological category, adds nothing to mortality prediction once the conditions through which racial inequality operates are accounted for. This is consistent with interpreting racial health inequalities as produced by socioeconomic and environmental structures rather than inherent biological differences between groups.
+
+SES remains the dominant mortality driver: below-poverty status carries HR 2.40 — 140% higher mortality than the middle-high reference. Cadmium at 1.364 is one specific downstream mechanism through which deprivation translates into death. The gap between these two figures tells you how much of poverty's mortality toll runs through channels other than cadmium — healthcare access, nutrition, housing quality, psychosocial stress.
+
+## Does race modify the cadmium effect? (Model 5)
+```{r interaction}
+tidy(m5, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(grepl("cadmium", term)) %>%
+  mutate(across(where(is.numeric), ~ round(., 3))) %>%
+  kable(caption = "**Model 5: Cadmium × Race interaction (multiplicative scale)**")
+```
+
+The cadmium × race interaction term has HR 0.962 (p = 0.614) — not significant. Cadmium is equally harmful to Black and White Americans on the multiplicative scale. The disparity is not in how the body responds to cadmium, but in who gets exposed to it. This matters for policy: reducing cadmium exposure would benefit both groups equally in relative terms, but would produce larger absolute gains for Black Americans because they currently carry higher burdens.
+
+## Additive interaction — does poverty amplify the cadmium effect?
+
+Model 5 tests multiplicative interaction — whether cadmium's *relative* effect differs by poverty status. But for public health policy, the more relevant question is additive: does having *both* poverty AND high cadmium produce more absolute excess mortality than the sum of their individual effects? If so, the two exposures are synergistic, and environmental interventions would be disproportionately valuable in deprived communities.
+
+I estimate this using the Relative Excess Risk due to Interaction (RERI), following VanderWeele & Knol (2014, *Epidemiologic Methods*). The approach fits a Cox model with a four-level joint exposure variable — reference (neither), cadmium only, poverty only, both — and computes RERI = HR₁₁ − HR₁₀ − HR₀₁ + 1. Under purely additive effects, RERI = 0. RERI > 0 indicates synergy.
+```{r reri}
+wb_reri <- wb_data %>%
+  filter(!is.na(ses_cat), !is.na(cadmium_hilow)) %>%
+  mutate(
+    poverty   = as.integer(ses_cat == "Below poverty"),
+    cad_high  = as.integer(cadmium_hilow == "High"),
+    joint_grp = case_when(
+      poverty == 0 & cad_high == 0 ~ "ref",
+      poverty == 0 & cad_high == 1 ~ "cad_only",
+      poverty == 1 & cad_high == 0 ~ "pov_only",
+      poverty == 1 & cad_high == 1 ~ "both"
+    ),
+    joint_grp = factor(joint_grp,
+                       levels = c("ref", "cad_only", "pov_only", "both"))
+  )
+
+cat("Joint exposure group sizes:\n")
+print(table(wb_reri$joint_grp))
+
+m_reri <- coxph(
+  Surv(surv_months, allcause_death) ~
+    joint_grp + age + sex + race + smoking,
+  data = wb_reri
+)
+
+tidy(m_reri, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(grepl("joint_grp", term)) %>%
+  mutate(
+    term = gsub("joint_grp", "", term),
+    across(c(estimate, conf.low, conf.high, p.value), ~ round(., 4))
+  ) %>%
+  dplyr::select(term, estimate, conf.low, conf.high, p.value) %>%
+  kable(
+    col.names = c("Group", "HR", "Lower 95% CI", "Upper 95% CI", "p-value"),
+    caption   = "**Table 4. Cox model for RERI — four-level joint exposure**"
+  )
+
+reri_coefs <- coef(m_reri)
+reri_vcov  <- vcov(m_reri)
+term_names <- names(reri_coefs)
+i_01 <- which(term_names == "joint_grpcad_only")
+i_10 <- which(term_names == "joint_grppov_only")
+i_11 <- which(term_names == "joint_grpboth")
+
+HR_01 <- exp(reri_coefs[i_01])
+HR_10 <- exp(reri_coefs[i_10])
+HR_11 <- exp(reri_coefs[i_11])
+RERI  <- HR_11 - HR_10 - HR_01 + 1
+
+grad       <- numeric(length(reri_coefs))
+grad[i_01] <- -HR_01
+grad[i_10] <- -HR_10
+grad[i_11] <-  HR_11
+
+var_RERI   <- as.numeric(t(grad) %*% reri_vcov %*% grad)
+se_RERI    <- sqrt(var_RERI)
+ci_lo_reri <- RERI - 1.96 * se_RERI
+ci_hi_reri <- RERI + 1.96 * se_RERI
+p_reri     <- 2 * (1 - pnorm(abs(RERI / se_RERI)))
+
+cat("\n--- RERI result ---\n")
+cat("HR_01 (high cadmium only): ", round(HR_01, 4), "\n")
+cat("HR_10 (poverty only):      ", round(HR_10, 4), "\n")
+cat("HR_11 (both):              ", round(HR_11, 4), "\n")
+cat("RERI =", round(RERI, 4),
+    "(95% CI:", round(ci_lo_reri, 4), "–", round(ci_hi_reri, 4),
+    ", p =", round(p_reri, 4), ")\n")
+```
+
+RERI = 0.088 (95% CI: −0.46 to 0.64, p = 0.75). The direction is positive — pointing toward synergy — but the confidence interval is wide and crosses zero. The finding is not statistically significant.
+
+This result deserves an honest interpretation rather than a dismissive one. The positive direction is consistent across all the analyses in this document: the SES-cadmium dose-response gradient, the racial cadmium gap in never-smokers, and now the RERI all point in the same direction. The problem is precision, not direction. The `pov_only` group — people below poverty with *low* cadmium — contains only 654 participants, roughly a quarter of the other groups. This small cell drives most of the uncertainty. It is also substantively meaningful: in these data, poverty and high cadmium travel together so tightly that it is genuinely difficult to find many poor people with low cadmium burden. That itself reflects the environmental justice reality.
+
+## Checking model assumptions: Schoenfeld residuals
+```{r schoenfeld, fig.height=8}
+ph_test <- cox.zph(m4)
+print(ph_test)
+par(mfrow = c(3, 3))
+plot(ph_test)
+par(mfrow = c(1, 1))
+```
+
+The Cox model assumes that hazard ratios remain constant over time — proportional hazards. The Schoenfeld residual test checks this for each variable. Cadmium passes cleanly (p = 0.665), meaning its effect on mortality is consistent across the follow-up period. This is biologically plausible: cadmium accumulates gradually and its toxic consequences build progressively, so a stable hazard ratio through time makes mechanistic sense.
+
+Age is flagged as borderline (p = 0.017), but visual inspection of the residual plot shows no meaningful systematic trend — with N ≈ 10,000, even trivially small and clinically irrelevant deviations from proportionality become statistically detectable. The global test (p = 0.053) is borderline but non-significant. The proportional hazards assumption is satisfied for practical purposes.
+
+## Sensitivity analysis: is cadmium just measuring smoking?
+
+A reasonable concern is that cadmium might simply be proxying for cigarette exposure, in which case the cadmium HR would be redundant with smoking status already in the model. To test this, I fit parallel models replacing cadmium with serum cotinine — a nicotine metabolite that *exclusively* reflects tobacco smoke exposure.
+```{r cotinine}
+m_cot_crude <- coxph(Surv(surv_months, allcause_death) ~
+                       cotinine_log, data = wb_data)
+m_cot_adj   <- coxph(Surv(surv_months, allcause_death) ~
+                       cotinine_log + age + sex + race + ses_cat + smoking,
+                     data = wb_data)
+
+cat("Cotinine crude HR:\n")
+tidy(m_cot_crude, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term == "cotinine_log") %>%
+  mutate(across(where(is.numeric), ~ round(., 3))) %>%
+  dplyr::select(term, estimate, conf.low, conf.high, p.value) %>%
+  print()
+
+cat("\nCotinine adjusted HR:\n")
+tidy(m_cot_adj, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term == "cotinine_log") %>%
+  mutate(across(where(is.numeric), ~ round(., 3))) %>%
+  dplyr::select(term, estimate, conf.low, conf.high, p.value) %>%
+  print()
+
+cat("\nCadmium adjusted HR (Model 4):",
+    round(exp(coef(m4)["cadmium_log"]), 3), "\n")
+```
+
+After full adjustment, cotinine has an HR of 1.06, compared to cadmium's HR of 1.364. If cadmium were simply measuring smoking, these should be comparable — cotinine is a more specific and direct smoking biomarker. The substantial gap confirms that cadmium captures environmental toxic burden from industrial, dietary, and residential sources that smoking status cannot account for. The cadmium signal is not a tobacco signal in disguise.
+
+---
+
+# Level 3 — Counterfactual
+
+*This is the most ambitious analytical step. Rather than asking what patterns exist (Level 1) or what the adjusted association is (Level 2), I am now asking a directly policy-relevant question: what would have happened to a specific group if their environmental exposure had been different?*
+
+## The causal question
+
+> *If people below the poverty line had experienced the cadmium exposure distribution of middle-high income people — everything else about them unchanged — what would their 10-year survival look like?*
+
+This is a counterfactual question. It asks about a world that does not exist, but that could be approximated through environmental regulation, industrial pollution controls, or housing policy. To answer it I use g-computation, following Hernán & Robins (*What If?*, Chapter 13): fit a Weibull accelerated failure time model predicting survival from cadmium and covariates, then simulate what survival would look like under a different cadmium distribution.
+
+A deliberate structural decision: SES is excluded from the outcome model. This is because I want to isolate the specific pathway from SES *through cadmium* to mortality. Including SES in the outcome model would absorb the variance running through that channel, and the g-computation would return close to zero — not because cadmium is irrelevant, but because I would have statistically closed the pathway I was trying to measure.
+```{r gcomp}
+poor_dat <- wb_data %>%
+  filter(ses_cat == "Below poverty",
+         !is.na(cadmium_log), !is.na(age),
+         !is.na(sex), !is.na(smoking))
+
+rich_dat <- wb_data %>%
+  filter(ses_cat == "Middle-high",
+         !is.na(cadmium_log), !is.na(age),
+         !is.na(sex), !is.na(smoking))
+
+cat("Group sizes:\n")
+cat("  Below poverty: n =", nrow(poor_dat), "\n")
+cat("  Middle-high:   n =", nrow(rich_dat), "\n")
+cat("\nCadmium gap (log scale):\n")
+cat("  Below poverty median:", round(median(poor_dat$cadmium_log), 3), "\n")
+cat("  Middle-high median:  ", round(median(rich_dat$cadmium_log), 3), "\n")
+
+gcomp_mod <- survreg(
+  Surv(surv_months, allcause_death) ~
+    cadmium_log + age + sex + race + smoking,
+  data = wb_data, dist = "weibull"
+)
+
+pred_surv <- function(mod, dat, t) {
+  lp <- predict(mod, newdata = dat, type = "lp")
+  1 - pweibull(t, shape = 1 / mod$scale, scale = exp(lp))
+}
+
+surv_obs <- pred_surv(gcomp_mod, poor_dat, 120)
+
+set.seed(42)
+poor_cf <- poor_dat %>%
+  mutate(cadmium_log = sample(rich_dat$cadmium_log,
+                               size = n(), replace = TRUE))
+surv_cf <- pred_surv(gcomp_mod, poor_cf, 120)
+
+obs_10yr  <- mean(surv_obs, na.rm = TRUE)
+cf_10yr   <- mean(surv_cf,  na.rm = TRUE)
+abs_diff  <- cf_10yr - obs_10yr
+attr_frac <- abs_diff / (1 - obs_10yr) * 100
+
+cat("\nPoint estimates (10-year survival):\n")
+cat("  Observed (below poverty): ", round(obs_10yr * 100, 2), "%\n")
+cat("  Counterfactual:           ", round(cf_10yr  * 100, 2), "%\n")
+cat("  Absolute difference:      ", round(abs_diff * 100, 2), "pp\n")
+cat("  Attributable fraction:    ", round(attr_frac, 2), "%\n")
+```
+```{r bootstrap, cache=TRUE}
+set.seed(42)
+n_boot     <- 500
+boot_diffs <- numeric(n_boot)
+
+for (b in seq_len(n_boot)) {
+  bd <- wb_data[sample(nrow(wb_data), replace = TRUE), ]
+  bp <- bd %>% filter(ses_cat == "Below poverty",
+                      !is.na(cadmium_log), !is.na(age),
+                      !is.na(sex), !is.na(smoking))
+  br <- bd %>% filter(ses_cat == "Middle-high",
+                      !is.na(cadmium_log), !is.na(age),
+                      !is.na(sex), !is.na(smoking))
+  if (nrow(bp) < 50 || nrow(br) < 50) next
+  bm <- tryCatch(
+    survreg(Surv(surv_months, allcause_death) ~
+              cadmium_log + age + sex + race + smoking,
+            data = bd, dist = "weibull"),
+    error = function(e) NULL
+  )
+  if (is.null(bm)) next
+  s_obs <- mean(pred_surv(bm, bp, 120), na.rm = TRUE)
+  bp_cf <- bp %>% mutate(
+    cadmium_log = sample(br$cadmium_log, size = n(), replace = TRUE)
+  )
+  s_cf  <- mean(pred_surv(bm, bp_cf, 120), na.rm = TRUE)
+  boot_diffs[b] <- s_cf - s_obs
+}
+
+boot_diffs <- boot_diffs[boot_diffs != 0]
+ci_lo      <- quantile(boot_diffs, 0.025) * 100
+ci_hi      <- quantile(boot_diffs, 0.975) * 100
+
+cat("=================================================\n")
+cat("G-COMPUTATION FINAL RESULT\n")
+cat("=================================================\n")
+cat("Observed 10-year survival (below poverty):",
+    round(obs_10yr * 100, 2), "%\n")
+cat("Counterfactual 10-year survival:          ",
+    round(cf_10yr  * 100, 2), "%\n")
+cat("Absolute difference:", round(abs_diff * 100, 2), "pp",
+    "(95% CI:", round(ci_lo, 2), "–", round(ci_hi, 2), "pp)\n")
+cat("Attributable fraction:", round(attr_frac, 2), "%\n")
+cat("Bootstrap iterations: ", length(boot_diffs), "\n")
+cat("=================================================\n")
+```
+
+Equalising cadmium exposure would increase 10-year survival among people below the poverty line by **1.62 percentage points (95% CI: 1.14–2.14)**. The confidence interval excludes zero across 500 bootstrap replications.
+
+The attributable fraction of 12.85% means roughly one in eight excess deaths among people below the poverty line is attributable specifically to their higher cadmium burden compared to middle-high income individuals. That is not a trivial quantity, and it is worth being precise about what it represents: this is the contribution of *one pollutant, through one biomarker, in one dataset*. Cadmium is one chemical out of hundreds that are distributed along socioeconomic lines. The total mortality burden attributable to cumulative environmental disadvantage is almost certainly substantially larger.
+
+Three assumptions are required for this estimate to have a causal interpretation. **Consistency** — the observed outcomes under each cadmium level correspond to what would happen under an intervention at that level — is plausibly satisfied. **Exchangeability** — no unmeasured confounders differ between SES groups beyond those adjusted — is partially violated: healthcare access, residential history, and psychosocial stress are not measured in NHANES, meaning the 1.62pp estimate is an upper bound on the true causal effect. **No interference** — one person's cadmium does not affect another's survival — is plausibly satisfied. I state these assumptions explicitly not to undermine the result, but because being transparent about the limits of what observational data can establish is how causal claims remain credible.
+
+---
+
+# Discussion
+
+## What I found and what it means
+
+The central finding is that blood cadmium is independently associated with 36% higher all-cause mortality after full adjustment for age, sex, race, SES, and smoking. The sequential model-building approach reveals the confounding architecture with clarity: age acts as a negative confounder (masking part of the cadmium effect in crude models), SES as a positive confounder (inflating it), and smoking as a mixed-role variable that both confounds and mediates. The residual HR after smoking adjustment — the effect operating through non-smoking routes — remains large and highly significant, confirmed by the cotinine sensitivity analysis.
+
+The racial mortality finding is worth pausing on. The crude survival curves suggest Black Americans live longer than White Americans — a finding so obviously misleading that it would be dangerous without the analytical context to explain it. After accounting for age composition, SES, cadmium burden, and smoking, race carries no independent mortality effect (HR 0.938, p = 0.282). The crude racial gap is entirely accounted for by measurable structural factors. This does not mean race does not matter — it means race matters precisely *through* the socioeconomic and environmental conditions it produces, not through biology.
+
+The SES gradient in cadmium — graded, not threshold, affecting the entire income distribution — has a specific policy implication: interventions targeting only the most extreme poverty would miss the substantial excess burden carried by the low-middle income group. Environmental health policy needs to address the whole gradient.
+
+The RERI analysis found a positive but imprecise signal (RERI = 0.088, p = 0.75), directionally consistent with synergy between poverty and high cadmium on the absolute mortality scale. The precision problem arises from a genuinely small group of poor people with low cadmium in NHANES — in these data, poverty and high cadmium co-occur so reliably that separating their individual contributions is statistically difficult. The direction of the finding adds to a consistent picture across all analyses pointing toward synergy rather than simple additivity.
+
+The g-computation estimate translates the statistical findings into a policy-relevant quantity: 1.62 percentage points of 10-year survival — roughly one in eight excess deaths in poverty — attributable to differential cadmium burden. As a single-pollutant upper bound, this framing is analytically conservative and credible.
+
+## Limitations
+
+**Single timepoint measurement.** Cadmium was measured at one survey visit. Its long biological half-life makes this a reasonable cumulative proxy, but it introduces measurement error that likely attenuates estimates toward the null — the true effect is probably larger than observed.
+
+**All-cause mortality.** Using all-cause mortality dilutes the cadmium-specific signal. Many deaths are caused by conditions where cadmium is less implicated. Cancer-specific, cardiovascular-specific, and renal-specific analyses would be more informative but are underpowered in this sample.
+
+**Unmeasured confounding.** Healthcare access, full residential history, dietary quality, and psychosocial stress are not available. The g-computation estimate is an upper bound on the true causal effect.
+
+**US-specific context.** The near-poor paradox in the SES survival curves reflects a US insurance system that would not operate the same way under universal healthcare coverage. These results are not directly transferable without replication in other settings.
+
+## A note on methods
+
+The analytical framework used here — DAG-informed adjustment, sequential confounding decomposition, additive interaction analysis, g-computation for counterfactual estimation — represents a deliberate choice to prioritise causal transparency over statistical sophistication. Each method was selected because it answers a specific question that the previous method could not: description motivates the causal questions, the Cox sequence reveals the confounding architecture, RERI tests whether effects are synergistic on the policy-relevant absolute scale, and g-computation produces the policy-relevant quantity directly. The non-collapsibility of the Cox HR — the reason why HR changes across models cannot be read as proportion-mediated estimates — is why g-computation on the survival probability scale is used for the final causal estimate rather than a naive mediation decomposition.
+
+---
+
+# Generative AI Use
+
+This analysis was developed with the assistance of Claude (Anthropic), used as an interactive methodological and analytical collaborator. Specifically, Claude was used to discuss causal inference methodology including Pearl's ladder of causation, DAG specification, HR non-collapsibility, RERI estimation via the delta method, and g-computation implementation; to iteratively draft and refine R code for data harmonisation, sequential Cox modelling, bootstrap confidence intervals, and additive interaction analysis; and to assist in structuring the analytical narrative and connecting methodological choices to their epidemiological rationale.
+
+All statistical outputs, model results, and numerical findings reported in this document were verified by the author against R console output. The causal reasoning, epidemiological interpretation, analytical decisions — including the choice to drop the causal survival forest section after identifying overlap violations that rendered the ATE estimate unstable — and the conclusions reflect the author's own judgement and domain knowledge. All code was reviewed, tested, and executed in a local R environment.
+
+The use of AI assistance is declared in the interest of transparency and consistent with emerging norms for responsible AI use in academic and research contexts.
